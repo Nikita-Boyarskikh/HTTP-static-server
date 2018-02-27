@@ -1,8 +1,9 @@
 Mouse
 IO::Async::Loop
 IO::Async::Handle
+IO::Async::Loop::EV
 URI::Escape
 HTTP::Date
 Getopt::Long::Any
 Getopt::Long::Continue
-Epoll
+EV
