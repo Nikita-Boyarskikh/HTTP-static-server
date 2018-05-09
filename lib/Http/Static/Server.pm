@@ -5,8 +5,9 @@ use warnings FATAL => 'all';
 our $VERSION = '0.0.1';
 
 use Mouse;
+use Fcntl;
 use IO::Socket::INET;
-use IO::File;
+use File::Copy;
 use IO::Async::Loop;
 use IO::Async::Handle;
 use File::Spec::Functions qw(catfile);
@@ -38,6 +39,8 @@ has 'timeout',       is => 'rw';
 has 'conn_state',    is => 'rw', default => 'Keep-Alive', required => 1;
 
 has 'server',        is => 'rw';
+has 'processes',     is => 'rw', default => 0;
+has 'last_proc',     is => 'rw', default => 0;
 has 'buffer_size',   is => 'rw', default => 128;
 has 'loop',          is => 'rw', default => sub { IO::Async::Loop->new };
 has 'log_fh',        is => 'rw', default => sub { \*STDOUT };
@@ -47,25 +50,30 @@ $IO::Async::Loop::LOOP = 'EV,Epoll,Poll';
 sub BUILD {
     my $self = shift;
 
-    my $server = IO::Socket::INET->new(
+    $self->server(IO::Socket::INET->new(
         LocalHost => $self->host,
         LocalPort => $self->port,
         Proto     => $self->proto,
-        Listen    => $self->thread_limit * $self->cpu_limit,
+        Listen    => $self->thread_limit,
         Timeout   => $self->timeout,
         ReuseAddr => 1,
         Blocking  => 0,
-    ) or die("Can't bind to '${\$self->host}:${\$self->port}': $!\n");
-    $self->server($server);
+    ) or die("Can't bind to '${\$self->host}:${\$self->port}': $!\n"));
 
     my $socket = IO::Async::Handle->new(
         handle => $self->server,
         on_read_ready => sub {
-            my $client = $self->server->accept;
-            $client->autoflush(1);
-            $self->_subscribe_quit_events('INT', 'TERM', 'QUIT', 'HUP');
-            $self->log('New connection from: ' . $client->peerhost . ':' . $client->peerport);
-            $self->serve_static($client);
+            if ($self->processes == $self->cpu_limit) {
+                waitpid $self->last_proc, 0;
+            }
+            $self->processes($self->processes + 1);
+            unless (my $pid = fork) {
+                my $code = $self->_serve_static;
+                $self->processes($self->processes - 1);
+                exit $code;
+            } else {
+                $self->last_proc($pid);
+            }
         },
         on_write_ready => sub {},
     );
@@ -74,23 +82,23 @@ sub BUILD {
 
 sub _print_403 {
     my ($self, $client) = @_;
-    print $client 'HTTP/1.1 403 Permission Denied' . Socket::CRLF;
+    syswrite $client, 'HTTP/1.1 403 Permission Denied' . Socket::CRLF;
     $self->print_headers($client);
-    print $client Socket::CRLF;
+    syswrite $client, Socket::CRLF;
 }
 
 sub _print_404 {
     my ($self, $client) = @_;
-    print $client 'HTTP/1.1 404 Not Found' . Socket::CRLF;
+    syswrite $client, 'HTTP/1.1 404 Not Found' . Socket::CRLF;
     $self->print_headers($client);
-    print $client Socket::CRLF;
+    syswrite $client, Socket::CRLF;
 }
 
 sub _print_405 {
     my ($self, $client) = @_;
-    print $client 'HTTP/1.1 405 Method Not Allowed' . Socket::CRLF;
+    syswrite $client, 'HTTP/1.1 405 Method Not Allowed' . Socket::CRLF;
     $self->print_headers($client);
-    print $client Socket::CRLF;
+    syswrite $client, Socket::CRLF;
 }
 
 sub _print_200 {
@@ -99,11 +107,11 @@ sub _print_200 {
     my $content_length = -s $realpath;
     my $mimetype = get_mimetype($realpath);
 
-    print $client 'HTTP/1.1 200 OK' . Socket::CRLF;
+    syswrite $client, 'HTTP/1.1 200 OK' . Socket::CRLF;
     $self->print_headers($client);
-    print $client 'Content-Type: ' . $mimetype . Socket::CRLF;
-    print $client 'Content-Length: ' . $content_length . Socket::CRLF;
-    print $client Socket::CRLF;
+    syswrite $client, 'Content-Type: ' . $mimetype . Socket::CRLF;
+    syswrite $client, 'Content-Length: ' . $content_length . Socket::CRLF;
+    syswrite $client, Socket::CRLF;
 }
 
 sub _subscribe_quit_events {
@@ -131,8 +139,15 @@ sub stop {
     $self->loop->stop;
 }
 
-sub serve_static {
-    my ($self, $client) = @_;
+sub _serve_static {
+    my ($self) = @_;
+
+    my $client = $self->server->accept;
+    return 0 unless $client;
+
+    $self->_subscribe_quit_events('INT', 'TERM', 'QUIT', 'HUP');
+    $self->log('New connection from: ' . $client->peerhost . ':' . $client->peerport);
+
     my $base = $self->document_root // q{.};
     my $realbase = Cwd::realpath($base) or die 'Wrong base dir: ' . $base;
     my $request = parse_http_request_from($client) or return 0;
@@ -166,16 +181,13 @@ sub serve_static {
         return 0;
     }
 
-    my $fh = IO::File->new();
-    $fh->open($realpath) or die $!;
+    my $fh;
+    sysopen($fh, $realpath, O_RDONLY) or die $!;
     binmode $fh;
     binmode $self->server;
     $self->_print_200($client, $realpath);
     if ($request->{METHOD} ne 'HEAD') {
-        my $buffer;
-        while (read($fh, $buffer, $self->buffer_size)) {
-            print $client $buffer;
-        }
+        copy($fh, $client);
     }
     $self->log($request->{METHOD}, $request->{URL}, "-> 200 ($realpath)");
     return 1;
@@ -191,8 +203,8 @@ sub print_headers {
     my ($self, $fh) = @_;
 
     my $date = time2str(time);
-    print  $fh 'Date: ' . $date . Socket::CRLF;
-    print  $fh 'Connection: ' . $self->conn_state . Socket::CRLF;
+    syswrite  $fh, 'Date: ' . $date . Socket::CRLF;
+    syswrite  $fh, 'Connection: ' . $self->conn_state . Socket::CRLF;
     printf $fh 'Server: %s(%s) (%s)' . Socket::CRLF, $self->server_name, $VERSION, $^O;
 }
 

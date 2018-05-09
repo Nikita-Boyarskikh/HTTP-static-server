@@ -7,7 +7,9 @@ WORKDIR /var/www/
 
 RUN cpan install $(cat ./requirements.txt | xargs)
 
-COPY . .
+COPY ./bin ./bin
+COPY ./lib ./lib
+
 EXPOSE 80
 
 ENTRYPOINT perl bin/main.pl -c etc/httpd.cfg

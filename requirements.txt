@@ -1,7 +1,7 @@
 Mouse
 IO::Async::Loop
-IO::Async::Handle
 IO::Async::Loop::EV
+IO::Async::Handle
 URI::Escape
 HTTP::Date
 Getopt::Long::Any
